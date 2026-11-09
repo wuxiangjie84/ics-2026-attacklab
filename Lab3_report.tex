@@ -52,32 +52,22 @@
 \pagestyle{plain}
 
 \section{实验目的}
-本实验先用 gdb 观察 \code{dark-calc} 的调用栈，弄清函数调用时栈帧怎么建立、
-返回地址放在哪里；然后用 \code{gets()} 的栈溢出完成四个利用：跳转执行
-\code{./malware}、在固定可执行栈上跑一小段指令、用 ROP 绕过不可执行栈，以及绕过
-\code{dark-log} 的 Stack Protector（Canary）。这四个任务分别对应缓冲区溢出、
-栈不可执行、non-PIE 代码段复用和 Canary 四种机制。
+本实验先通过 GDB 观察 \code{dark-calc} 运行时的调用栈和寄存器变化，弄清函数调用、栈帧建立与返回的过程。随后利用 \code{gets()} 造成的栈缓冲区溢出，依次完成四个任务：跳转执行外部脚本 \code{./malware}、在固定可执行栈上运行自写机器码、使用 ROP 链绕过不可执行栈（NX），以及绕过 \code{dark-log} 的栈保护（Canary）。
 
 \section{实验环境}
 \begin{itemize}
-  \item 操作系统：Windows 11，实验二进制在 WSL 2 的 Ubuntu 26.04.1 LTS
-        （内核 6.18.33.2-microsoft-standard-WSL2）中运行；
-  \item 调试器：GNU gdb 17.1，使用原生的 \code{info registers}、\code{x}、\code{si}、\code{bt} 等命令；
-  \item 编程语言：Python 3.14.4，用于生成 payload 并通过管道或重定向输入目标程序；
+  \item 操作系统：Windows 11，WSL 2 Ubuntu 26.04.1 LTS（内核 6.18.33.2-microsoft-standard-WSL2）；
+  \item 调试与分析工具：GNU gdb 17.1、objdump、readelf；
+  \item 编程语言：Python 3.14.4，用于生成二进制 payload；
   \item 实验目录：Windows 下为 \code{E:\textbackslash ICS\textbackslash Lab3}，WSL 中为 \code{/mnt/e/ICS/Lab3}；
-  \item 实验对象：\code{attack/} 下的 \code{dark-calc}、\code{dark-calc-nx}、
-        \code{dark-log} 与 \code{malware}，均为课程提供的 non-PIE ELF 可执行文件；
+  \item 实验对象：\code{attack/} 目录下的 \code{dark-calc}、\code{dark-calc-nx}、\code{dark-log} 与 \code{malware}；
   \item 个人仓库：\url{https://github.com/wuxiangjie84/ics-2026-attacklab}。
 \end{itemize}
-实验对象是课程提供的四个二进制；\code{attack/} 下的文件未作修改，SHA-256 与仓库
-校验配置中记录的值一致。
 
 \section{程序的调用栈}
 
 \subsection{观察方法}
-在 \code{attack/} 目录执行 \code{gdb ./dark-calc}，用 \code{b input} 在 \code{input}
-处下断点并运行（输入 \code{123} 后 EOF）。gdb 把断点落在 \code{0x40197f}，即
-\code{input+8}、prologue 之后的位置：
+在 \code{attack/} 目录启动 \code{gdb ./dark-calc}，用 \code{b input} 给 \code{input} 函数下断点并运行（输入 \code{123} 后按 Ctrl-D 结束）。断点停在 \code{0x40197f}（\code{input+8}），此时函数开头的栈帧初始化已经执行完：
 \begin{lstlisting}
 $ gdb -q ./dark-calc
 Breakpoint 1 at 0x40197f
@@ -94,37 +84,24 @@ rsp            0x721000800fd0      0x721000800fd0
 \end{lstlisting}
 
 \subsection{问题 1：input 函数是谁调用的}
-trace 显示 \code{\#1 0x0000000000401ad1 in main ()}，所以 \code{input} 由
-\code{main} 调用：\code{main+9} 处的 \code{call 0x401977 <input>}，返回地址
-\code{0x401ad1} 就是 \code{main+14} 的 \code{mov \$0x0,\%eax}。
-补充说明：\code{main} 本身由 \code{\_\_wrap\_main} 调用。实验为了把 \code{rsp}
-切换到 \code{init\_fixed\_stack()} 建立的固定栈，链接时使用了 \code{--wrap=main}；
-\code{\_\_wrap\_main} 先保存 \code{r12} 并把 \code{rsp} 设为 \code{fixed\_stack\_top}，
-再 \code{call main}。因为 \code{rsp} 被手工切换，gdb 的 backtrace 只展开到
-\code{main}，看不到更上层的调用者。
+调用栈回溯显示 \code{\#1 0x0000000000401ad1 in main ()}，说明 \code{input} 是由 \code{main} 调用的。调用点在 \code{main+9} 的 \code{call 0x401977 <input>}，返回地址 \code{0x401ad1} 对应下一条指令 \code{main+14}（\code{mov \$0x0,\%eax}）。
+
+如果进一步查看反汇编，可以看到 \code{main} 实际上是由 \code{\_\_wrap\_main} 调用的。链接时程序使用了 \code{--wrap=main} 选项，先在 \code{\_\_wrap\_main} 里把 \code{rsp} 切换到 \code{init\_fixed\_stack()} 分配的固定栈顶 \code{fixed\_stack\_top}，然后再 \code{call main}。因为栈指针在这里被手动换掉了，GDB 的 \code{bt} 回溯到 \code{main} 就会停下。
 
 \subsection{问题 2：停下位置之前的三条指令与 rbp 的来源}
-objdump 显示 \code{input} 的开头为：
+用 objdump 查看 \code{input} 开头几条指令：
 \begin{lstlisting}
 0x401977 <input>:      55                push   %rbp
 0x401978 <input+1>:    48 89 e5          mov    %rsp,%rbp
 0x40197b <input+4>:    48 83 ec 10       sub    $0x10,%rsp
 0x40197f <input+8>:    be 0f 00 00 00    mov    $0xf,%esi
 \end{lstlisting}
-这三条指令是 prologue：\code{push \%rbp} 保存调用者的帧基址；
-\code{mov \%rsp,\%rbp} 把 \code{rbp} 设为本帧基址；\code{sub \$0x10,\%rsp}
-为局部数组 \code{char expression[16]} 分配 0x10 字节。此时
-\code{\$rbp = 0x721000800fe0}，而 \code{[\$rbp] = 0x721000800ff0}，这个值是
-\code{main} 的 \code{rbp}：main 的 prologue 把 \code{rbp} 设为
-\code{0x721000800ff0}，input 的 \code{push \%rbp} 又把它压到
-\code{0x721000800fe0}，成为本帧保存的调用者 \code{rbp}。所以 \code{\$rbp}
-指向的 8 个字节并不属于 input 的局部变量，而是 main 帧的“连接点”。
+断点前的三条指令完成了新栈帧的建立：\code{push \%rbp} 把调用者的栈帧基址压栈保存，\code{mov \%rsp,\%rbp} 将当前 \code{rsp} 设为 \code{input} 的栈帧基址，\code{sub \$0x10,\%rsp} 在栈上留出 16 字节给局部数组 \code{char expression[16]}。
+
+此时寄存器 \code{\$rbp = 0x721000800fe0}，栈内存 \code{[\$rbp] = 0x721000800ff0}。这个 \code{0x721000800ff0} 就是上一层 \code{main} 函数的 \code{rbp}，由 \code{input} 入口的 \code{push \%rbp} 写入 \code{0x721000800fe0}，用于在 \code{input} 返回时恢复 \code{main} 的栈帧。
 
 \subsection{问题 3：rbp+8 处存的值}
-\code{[\$rbp+8] = 0x0000000000401ad1}，即 \code{main+14} 的
-\code{mov \$0x0,\%eax}。对照 \code{disas main} 可以看到，它紧跟在
-\code{0x401acc} 的 \code{call input} 之后，因此 \code{[\$rbp+8]} 就是
-\code{input} 的返回地址：
+\code{[\$rbp+8]} 处的值是 \code{0x0000000000401ad1}。对照 \code{main} 的反汇编可以看到，它紧挨在 \code{0x401acc} 的 \code{call input} 后面，也就是 \code{input} 执行完后要回到的返回地址：
 \begin{lstlisting}
 0x401ac3 <main>:      push   %rbp
 0x401ac4 <main+1>:    mov    %rsp,%rbp
@@ -170,12 +147,10 @@ rsp            0x721000800fd0      0x721000800fd0
 0x721000800fe8:	0x0000000000401ad1
 #0  0x000000000040197f in input ()
 #1  0x0000000000401ad1 in main ()\end{lstlisting}
-执行 call 前 \code{rsp = 0x721000800ff0}；call 之后 \code{rsp = 0x721000800fe8}，
-且 \code{[rsp] = 0x401ad1}。可见是 main 的 \code{call input}
-（\code{0x401acc}）写入了这个值：x86-64 的 \code{call} 会把返回地址压栈。
+执行 \code{call} 之前 \code{rsp = 0x721000800ff0}；单步执行 \code{call input}（\code{0x401acc}）后，\code{rsp} 减 8 变成 \code{0x721000800fe8}，同时 \code{[rsp]} 被写入 \code{0x401ad1}。说明这个返回地址是在执行 \code{call input} 指令时由硬件自动压入栈中的。
 
 \subsection{问题 5：call、prologue、leave、ret 的作用}
-从 input 的 \code{leave} 之前单步到调用者：
+在 \code{input} 即将返回前的 \code{leave}（\code{0x4019d5}）处下断点，单步跟回 \code{main}：
 \begin{lstlisting}
 $ gdb -q ./dark-calc
 Breakpoint 1 at 0x4019d5
@@ -202,23 +177,14 @@ rsp            0x721000800ff0      0x721000800ff0
 rip            0x401ad6            0x401ad6 <main+19>
 rbp            0x721000800ff0      0x721000800ff0
 rsp            0x721000800ff0      0x721000800ff0\end{lstlisting}
-从上面的单步结果可以看到：
+结合单步过程，这几步指令各自的职责如下：
 \begin{itemize}
-  \item \textbf{call}：先把返回地址（下一条指令地址）压栈并令 \code{rsp} 减 8，
-        再跳到被调用者。它建立了“调用点 $\rightarrow$ 返回地址”的联系，是
-        \code{ret} 能回到正确位置的原因；本例中 \code{call input} 把
-        \code{0x401ad1} 写到 input 的 \code{[rbp+8]}。
-  \item \textbf{prologue}（\code{push \%rbp; mov \%rsp,\%rbp; sub \$N,\%rsp}）：
-        保存调用者 \code{rbp}、建立新帧、为局部变量分配空间。此后局部变量用
-        \code{rbp} 减偏移访问，而 \code{rbp+8} 就是返回地址。正因为 \code{rbp}
-        是相对寻址的基准，payload 只需固定偏移（0x10 缓冲区 + 8 字节 saved
-        \code{rbp}）就能命中返回地址。
-  \item \textbf{leave}：\code{mov \%rbp,\%rsp; pop \%rbp}，丢弃本帧局部空间并恢复
-        调用者的 \code{rbp}；执行后 \code{rsp} 指向返回地址。
-  \item \textbf{ret}：弹出栈顶返回地址并跳转，同时 \code{rsp} 加 8；本例中把
-        控制权交还 \code{main+14}，栈恢复到调用前状态。
+  \item \textbf{call}：把下一条指令的地址（返回地址）压栈，使 \code{rsp} 减 8，然后修改 \code{rip} 跳转到被调用函数入口。本例中 \code{call input} 将 \code{0x401ad1} 压入 \code{0x721000800fe8}。
+  \item \textbf{prologue}（\code{push \%rbp; mov \%rsp,\%rbp; sub \$N,\%rsp}）：保存调用者的 \code{rbp}，把当前 \code{rsp} 设为新栈帧基址 \code{rbp}，再下移 \code{rsp} 分配局部变量空间。建帧后，局部变量位于 \code{rbp} 下方（负偏移），保存的旧 \code{rbp} 在 \code{[rbp]}，返回地址固定在 \code{[rbp+8]}。
+  \item \textbf{leave}：等价于 \code{mov \%rbp,\%rsp; pop \%rbp}。先把 \code{rsp} 拉回当前帧基址以回收局部变量空间，再从栈顶弹出调用者的旧 \code{rbp}，此时 \code{rsp} 正好停在返回地址处。
+  \item \textbf{ret}：从栈顶弹出 8 字节返回地址送入 \code{rip}，同时 \code{rsp} 加 8，程序回到 \code{main+14} 继续执行，栈指针也恢复到 \code{call} 之前的位置。
 \end{itemize}
-对应的栈帧布局（地址从高到低）为：
+此时 \code{input} 栈帧的完整布局（地址从高到低）如下：
 \begin{lstlisting}
 0x721000800ff8  [0x401c1f]          <- __wrap_main 中 call main 压入的返回地址
 0x721000800ff0  [0x7fffffffe6f0]    <- <main 的 rbp>
@@ -229,25 +195,19 @@ rsp            0x721000800ff0      0x721000800ff0\end{lstlisting}
 \end{lstlisting}
 
 \section{不同长度的字符串输入测试}
-\code{expression} 只有 \code{MAXLEN+1 = 16} 字节，而 \code{gets()} 会一直读到
-换行或 EOF，并额外写入一个 \code{\textbackslash 0}。分别输入 20 与 32 个 ASCII
-字符（写入 21 与 33 字节）：
+局部数组 \code{expression} 的大小只有 \code{MAXLEN+1 = 16} 字节，但 \code{gets()} 不检查缓冲区边界，会一直读到换行符或 EOF，并在末尾补一个 \code{\textbackslash 0}。下面用 20 个和 32 个字符 \code{'A'} 测试 \code{dark-calc}（实际写入栈中 21 字节和 33 字节）：
 \begin{center}
 \begin{tabular}{|c|c|p{4.6cm}|p{5.4cm}|}
 \hline
 输入长度 & 写入字节 & 覆盖范围 & 程序表现 \\
 \hline
-20 & 21 & expression[16] + saved rbp 低 4 字节 + 结束符 & 继续运行，最终 EOF 退出 0 \\
+20 & 21 & expression[16] + saved rbp 低 4 字节 + 结束符 & 继续运行，最终读到 EOF 以 0 退出 \\
 \hline
-32 & 33 & expression[16] + saved rbp 8 字节 + 返回地址 8 字节 + 1 & SIGSEGV，exit=139 \\
+32 & 33 & expression[16] + saved rbp 8 字节 + 返回地址 8 字节 + 结束符 & 触发 SIGSEGV（退出码 139） \\
 \hline
 \end{tabular}
 \end{center}
-20 字符时 \code{[rbp]} 的低 4 字节被 \code{0x41} 覆盖，gets 补的结束符落在第 5
-个字节（实测该 8 字节为 \code{0x0000720041414141}），但 \code{[rbp+8]} 仍是
-合法返回地址 \code{0x401ad1}，所以 input 照常返回 main。main 的 \code{rbp} 虽然
-被改坏，但后续 eval、input 各自用 \code{rsp} 重建 \code{rbp}；最后 input 在 EOF
-分支直接 \code{exit(0)}，main 没有执行 \code{leave; ret}，因此没有崩溃：
+输入 20 个 \code{'A'} 时，\code{[rbp]} 的低 4 字节被 \code{0x41} 覆盖，第 5 字节被写成 \code{0x00}（栈中该 8 字节变为 \code{0x0000720041414141}），但 \code{[rbp+8]} 处的返回地址 \code{0x401ad1} 没有受影响，\code{input} 仍能正常返回 \code{main}。虽然 \code{main} 的 \code{rbp} 被改坏了，但随后的 \code{eval} 和下一轮 \code{input} 都是根据 \code{rsp} 建立各自的新栈帧，且第二轮 \code{input} 读到 EOF 后直接调用 \code{exit(0)} 退出，没有走到 \code{main} 的返回指令，所以程序表面上没有报错：
 \begin{lstlisting}
 $ ./dark-calc < in20
 0
@@ -268,13 +228,9 @@ Executing: echo $((123))
 Enter an expression (length up to 15):
 42_is_The_Ànswer
 (exit status: 0)\end{lstlisting}
-上面 in20 那组输出里 \code{0} 出现在提示语之前：标准输出重定向到文件时
-\texttt{stdio} 从行缓冲变成全缓冲，提示语还留在用户态缓冲区，而
-\code{system()} 派生的 \code{echo} 已经把结果直接写到同一个文件描述符上。
-在终端里运行时顺序是正常的。
-32 字符时返回地址被 \code{0x4141414141414141} 覆盖，\code{input} 的
-\code{ret} 直接跳到该地址而段错误。用 gdb 在 \code{gets()} 返回后
-（\code{*0x40199f}）观察栈：
+这里 \code{in20} 的输出里 \code{0} 出现在提示语前面，是因为把 stdout 重定向到文件时 C 标准库会从行缓冲切换为全缓冲：\code{printf} 的提示语还留在用户态缓冲区里，而 \code{system()} 调起的子进程 \code{echo} 已经先一步写到了文件描述符中；直接在终端交互运行时顺序是正常的。
+
+当输入增加到 32 个 \code{'A'} 时，\code{[rbp+8]} 的返回地址被写成了 \code{0x4141414141414141}，\code{input} 执行 \code{ret} 试图跳往这个非法地址，立即触发段错误。在 \code{gets()} 返回位置（\code{0x40199f}）下断点可以看到栈被覆盖后的状态：
 \begin{lstlisting}
 $ gdb -q ./dark-calc
 Breakpoint 1 at 0x40199f
@@ -297,7 +253,7 @@ Program received signal SIGSEGV, Segmentation fault.
 #3  0x0000000000401c1f in __wrap_main ()
 #4  0x00007ffff7c2a601 in __libc_start_call_main (main=<optimized out>, argc=<optimized out>, argv=<optimized out>) at ../sysdeps/nptl/libc_start_call_main.h:59
 Backtrace stopped: Cannot access memory at address 0x4141414141414149\end{lstlisting}
-对照 20 字符的情况，只有 saved \code{rbp} 低 4 字节被写坏：
+对比 20 个字符时的栈内容，只有 saved \code{rbp} 的低字节被改写，返回地址完好：
 \begin{lstlisting}
 $ gdb -q ./dark-calc
 Breakpoint 1 at 0x40199f
@@ -311,57 +267,32 @@ rsp            0x721000800fd0      0x721000800fd0
 0x721000800fd0:	0x4141414141414141	0x4141414141414141
 0x721000800fe0:	0x0000720041414141	0x0000000000401ad1
 0x721000800ff0:	0x00007fffffffe6f0	0x0000000000401c1f\end{lstlisting}
-结论：溢出数据从缓冲区开始沿地址递增方向连续覆盖 saved \code{rbp} 与返回地址，
-因此可以精确控制 \code{ret} 的目标；同时 \code{gets()} 不检查长度，除
-\code{0x0a}（换行，gets 在此停止）外任意字节都能写入，这为构造包含二进制地址的
-payload 提供了条件。
+可以看到，越界输入会从 \code{expression}（\code{rbp-0x10}）开始向高地址连续覆盖 saved \code{rbp}（\code{rbp}）和返回地址（\code{rbp+8}）。只要在偏移 24 字节处放上目标地址，并且避开会让 \code{gets()} 提前截断的换行符 \code{0x0a}，就能在函数返回时把控制流劫持过去。
 
 \section{任务一：利用缓冲区漏洞执行 ./malware}
 
 \subsection{目标与限制}
-目标是让 \code{dark-calc} 执行同目录下的 \code{./malware}。\code{malware} 是一个
-shell 脚本，它用 \code{pstree} 和 \code{ps} 沿父进程链向上查找名为
-\code{dark-calc} 的进程，只有确认自己由 \code{dark-calc} 触发时才输出成功信息，
-因此必须让进程内派生出的 shell 执行它。
+任务一是让 \code{dark-calc} 执行同目录下的 \code{./malware}。查看 \code{malware} 脚本可知，它会用 \code{pstree} 和 \code{ps} 顺着父进程链往上找是否存在名为 \code{dark-calc} 的祖先进程，因此必须在 \code{dark-calc} 进程内部通过 \code{system()} 调起它。
 
-任务一的主要约束来自 \code{init\_fixed\_stack()}：它在 \code{.init\_array} 中被调用，
-用 \code{mmap} 在固定地址建立一块可执行“栈”，再把两端各 0x1000 字节
-\code{mprotect(PROT\_NONE)} 设为守卫页，并令
-\code{fixed\_stack\_top = 0x721000801000}。调用形式为：
+反汇编 \code{dark-calc} 可以看到，程序在启动阶段（\code{.init\_array}）调用了 \code{init\_fixed\_stack()}：它用 \code{mmap} 在固定地址映射了一块可读、可写、可执行的内存作为运行栈，然后用 \code{mprotect(PROT\_NONE)} 把首尾各 \code{0x1000} 字节设为不可访问的守卫页，并将栈顶 \code{fixed\_stack\_top} 设在 \code{0x721000801000}：
 \begin{lstlisting}
 mmap(0x721000000000, 0x802000, PROT_READ|WRITE|EXEC,
      MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK)
 \end{lstlisting}
-因此：
+这个设计带来两个直接影响：
 \begin{itemize}
-  \item 这块栈地址固定且可执行（这也是第七节“栈空间执行”成立的原因；
-        \code{readelf -l} 显示 GNU\_STACK 为 RW，真正生效的是这个 mmap）；
-  \item \code{expression[]} 固定在 \code{0x721000800fd0}，它到上守卫页只有
-        0x30 即 48 字节，payload 加上 gets 的 \code{\textbackslash 0} 必须不超过
-        48 字节，否则会写穿守卫页、在 gets 阶段就崩溃。
+  \item 虽然 \code{readelf -l} 显示 ELF 的 \code{GNU\_STACK} 段权限是 RW，但程序实际使用的是这块 \code{mmap} 出来的固定 RWX 区域，栈地址固定且允许执行指令；
+  \item \code{input()} 中的 \code{expression[]} 固定落在 \code{0x721000800fd0}，距离上守卫页 \code{0x721000801000} 只有 \code{0x30}（48）字节。因此整个 payload 加上 \code{gets()} 末尾写入的 \code{\textbackslash 0} 不能超过 48 字节，否则会在 \code{gets()} 写入时直接撞上守卫页崩溃。
 \end{itemize}
-此外 \code{input()} 在返回前会执行 \code{strcpy(command\_buf, expression)}，
-\code{command\_buf} 是全局数组，地址为 \code{0x6030d0}。
+另外，\code{input()} 在返回前会执行 \code{strcpy(command\_buf, expression)}，把输入字符串拷贝到全局变量 \code{command\_buf}（地址 \code{0x6030d0}）中。
 
 \subsection{攻击流程}
 \begin{enumerate}
-  \item 让输入以 \code{"./malware"} 加结束符开头。gets 把它读入 expression，
-        随后 input 自己的 \code{strcpy} 把该字符串复制到全局 \code{command\_buf}，
-        于是进程里保存了命令串 \code{"./malware"}。
-  \item 用 16 字节缓冲区 + 8 字节 saved \code{rbp} 之后的 8 字节覆盖返回地址，
-        指向 \code{0x401a6b}。这是 \code{eval()} 尾部的
-        \code{mov edi,0x6030d0; call system@plt}，效果等于执行
-        \code{system("./malware")}。执行到这条 call 时 \code{rsp} 是 16 的倍数，
-        call 压入返回地址后，system 入口处 \code{rsp \% 16 == 8}。
-  \item system 返回后 eval 还会执行 \code{fflush}，最后是 \code{leave; ret}。
-        把 saved \code{rbp} 设为 \code{0x721000800fe8}（即 saved rip 槽自身的
-        地址）：\code{leave} 会把 \code{[0x721000800fe8] = 0x401a6b} 弹进
-        \code{rbp}，\code{ret} 则使用 \code{[0x721000800ff0]}，即放在那里
-        的 \code{\_\_wrap\_main}（\code{0x401c0e}）。\code{\_\_wrap\_main} 把
-        \code{rsp} 重置为 \code{fixed\_stack\_top} 并再次 \code{call main}；
-        第二次 input 读到 EOF，走 \code{puts(answer); exit(0)}，进程干净退出。
+  \item 在 payload 开头放上 \code{"./malware\textbackslash 0"}，后面用 \code{'A'} 补齐 16 字节缓冲区。由于 \code{gets()} 遇到 \code{\textbackslash 0} 不会停止，整段 payload 会被完整读入栈中；而随后的 \code{strcpy} 遇到第一个 \code{\textbackslash 0} 就停止，正好只把 \code{"./malware"} 拷进 \code{command\_buf}。
+  \item 在偏移 \code{0x18}（返回地址）处填入 \code{0x401a6b}，跳到 \code{eval()} 尾部的两行指令 \code{mov \$0x6030d0,\%edi; call system@plt}，直接跳过前面拼接 \code{echo \$((...))} 的过程，执行 \code{system("./malware")}。跳过去时 \code{rsp = 0x721000800ff0}（16 的倍数），执行 \code{call system@plt} 压栈后完全符合 ABI 的 16 字节栈对齐要求。
+  \item 为了让程序在执行完 \code{system()} 后正常退出而不是崩溃，需要处理好 \code{eval()} 结尾的 \code{leave; ret}。我们在偏移 \code{0x10}（saved \code{rbp}）处填入 \code{0x721000800fe8}（即当前栈帧返回地址槽本身的地址），并在偏移 \code{0x20}（\code{0x721000800ff0}）处放上 \code{\_\_wrap\_main} 的地址 \code{0x401c0e}。这样 \code{eval()} 执行 \code{leave} 时会把 \code{rsp} 挪到 \code{0x721000800fe8} 并弹出 8 字节到 \code{rbp}，接着 \code{ret} 就会跳进 \code{0x721000800ff0} 处的 \code{\_\_wrap\_main}。\code{\_\_wrap\_main} 把 \code{rsp} 重置回固定栈顶并再次调用 \code{main}，第二轮 \code{input()} 读到 EOF 后输出 \code{answer} 并调用 \code{exit(0)} 正常结束。
 \end{enumerate}
-payload 共 40 字节布局如下（加 gets 的结束符为 41 字节，满足 48 字节窗口）：
+整个 payload 长度正好 40 字节（加上 \code{gets} 的 \code{\textbackslash 0} 共 41 字节，未超出 48 字节边界）：
 \begin{lstlisting}
 offset 0x00  "./malware" + 结束符 + 6 字节填充   -> strcpy 到 command_buf
 offset 0x10  p64(0x0000721000800fe8)            -> saved rbp（伪造帧，指向 rip 槽）
@@ -567,8 +498,8 @@ offset 0x50  p64(0x4016e0)  exit@plt
 offset 0x58  p64(0)         exit 的返回地址（不会用到）
 \end{lstlisting}
 SysV AMD64 要求函数入口处 \code{rsp \% 16 == 8}。可以先算一下 input 的
-\code{ret} 之后的 \code{rsp}：main 入口 \code{rsp} 是 8 mod 16，push rbp 后是
-0，call input 后是 8，input 里 push rbp 后是 0，sub \$0x10 仍是 0；所以
+\code{ret} 之后的 \code{rsp}：main 入口 \code{rsp} 是 8 mod 16，push \%rbp 后是
+0，call input 后是 8，input 里 push \%rbp 后是 0，sub \$0x10 仍是 0；所以
 input 的 \code{rbp} 是 16 的倍数，返回地址在 \code{rbp+8}，\code{ret} 之后
 \code{rsp} 是 \code{rbp+0x10}，即 0 mod 16。每执行一条 \code{ret}，\code{rsp}
 加 8，所以在跳入被调用函数前插一条 \code{ret}，就能把 \code{rsp} 调回 8
@@ -668,7 +599,7 @@ Enter a log message:
 \end{itemize}
 
 \section{验证}
-四个用例在 WSL 2 的 Ubuntu 26.04.1 上都跑过（\code{python3 payload\_*.py} 的输出通过
+四个用例在 WSL 2 的 Ubuntu 26.04.1 上都跑过（\code{python3 payload*.py} 的输出通过
 管道或重定向输入对应二进制，检查 stdout 是否包含目标串）。四个 payload 只依赖 non-PIE
 二进制中固定的地址、\code{dark-calc} 自己 \code{mmap} 出来的固定栈以及 ABI 约定，
 不依赖 glibc 版本；课程 CI 用的是 ubuntu-24.04，按这一点推断两版行为应该相同：
