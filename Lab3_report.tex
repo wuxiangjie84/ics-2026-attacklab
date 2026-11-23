@@ -215,14 +215,14 @@ Enter an expression (length up to 15):
 \end{lstlisting}
 
 进程树中，\code{dark-calc} 的子进程是 \code{sh}，\code{malware} 又是
-\code{sh} 的子进程。这与脚本检查祖先进程的方式一致。标准输出中出现了成功信息，
-这次运行的退出状态为 0。
+\code{sh} 的子进程。这与脚本检查祖先进程的方式一致。输出里出现了成功提示，进程也以状态码 0 正常退出。
 
 \subsection{两种输入的区别}
 
-我还测试了题目提到的另一种输入，同样看到了脚本的成功信息。
-那次执行与 \code{eval()} 拼接 shell 命令的方式有关。可见仅凭成功信息，
-无法判断是哪一种输入起了作用。
+我还测试了题目里能触发命令注入的输入，也看到了成功提示。
+\code{eval()} 把输入拼进交给 shell 的命令时，shell 会把其中的一部分当成命令语法解释。
+这一过程不需要发生缓冲区溢出。上面的脚本则通过栈缓冲区越界写入改变了函数的返回地址。
+两种输入都能出现同样的提示，要区分它们，需要看 shell 如何解释输入，以及调试时观察到的函数返回路径。
 
 \section{用 GDB 核对 \texorpdfstring{\code{main}}{main} 的机器码}
 
@@ -325,7 +325,9 @@ c3              ret               # 跳到 grade_eval
 
 \subsection{初版与最终版的运行结果}
 
-初版打印出目标信息后发生了段错误。下面是最终版的运行记录。
+初版打印出目标信息后，在返回阶段发生了段错误。
+对照栈帧可以看到，函数保存参数时的局部写入覆盖了部分 stub。
+打印成功只说明目标函数运行到了输出语句，返回时仍需要有效的返回地址。下面是最终版的运行记录。
 
 \begin{lstlisting}
 $ python3 ../payload_dark.py > payload.bin && ./dark-calc < payload.bin
@@ -443,7 +445,7 @@ Enter an expression (length up to 15):
 
 在 \code{dark-log} 的 \code{input()} 中，编译器在栈帧里保存一个保护值（canary），
 并在函数返回前把它与参考值比较。如果值发生了变化，程序就调用 \code{\_\_stack\_chk\_fail}。
-这个检查针对保护值本身。仅凭它相等，无法判断同一栈帧里的其他数据是否有过越界写入。
+这个检查只比较 canary 的值。如果越界写入改动了栈帧里的其他数据，canary 却仍与原值一致，这项检查就不会报错。
 
 \subsection{\texorpdfstring{\code{input()}}{input()} 的局部变量布局}
 
@@ -481,7 +483,7 @@ memcpy(f.logMsg + f.len,         // 目的地址 = logMsg + len
 \texttt{dest} = \texttt{rbp} - \texttt{0xa0} + \texttt{0xa8} = \texttt{rbp} + \texttt{0x8}
 \]
 
-计算所得位置是保存返回地址的栈槽。
+算出来正好落在保存返回地址的位置上。
 
 \code{len} 和 canary 相距 \code{0x20 - 0x8 = 0x18} 字节，gets 写入时先覆盖
 \code{len}、再覆盖 \code{pad}，最后才到 canary。我让输入刚好在 canary 之前停下，
